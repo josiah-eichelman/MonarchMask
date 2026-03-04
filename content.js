@@ -53,7 +53,8 @@ function getUniqueSelector(element) {
 // Initialize the extension
 function initCipher() {
   // Check if this is Monarch Money
-  const isMonarchMoney = window.location.hostname.includes('monarchmoney.com');
+  const hostname = window.location.hostname;
+  const isMonarchMoney = hostname.includes('monarchmoney.com') || hostname.includes('monarch.com');
   
   // Only run on Monarch Money
   if (!isMonarchMoney) {
