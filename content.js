@@ -2,6 +2,12 @@
 let cipherEnabled = false;
 let observer = null;
 
+// Regex that matches currency values and percentages in various formats:
+// $1,234.56  ($1,234.56)  -$1,234.56  +$1,234.56  $1.2k  $1.2M  45%  45.5%
+// Note: no /g flag here – callers create their own instances to avoid shared lastIndex state.
+// Note: optional sign is NOT followed by \s* to avoid consuming the preceding word-separator space.
+const SENSITIVE_NUMBER_REGEX = /(?:[-+])?[\$€£¥]\s*[\d,.']+(?:[kKmMbB])?|\([\$€£¥]\s*[\d,.']+(?:[kKmMbB])?\)|\b[\d,.']+(?:[kKmMbB])?\s*%/;
+
 // Helper function to get a unique CSS selector for an element
 function getUniqueSelector(element) {
   if (!element) return '';
@@ -47,7 +53,8 @@ function getUniqueSelector(element) {
 // Initialize the extension
 function initCipher() {
   // Check if this is Monarch Money
-  const isMonarchMoney = window.location.hostname.includes('monarchmoney.com');
+  const hostname = window.location.hostname;
+  const isMonarchMoney = hostname.includes('monarchmoney.com') || hostname.includes('monarch.com');
   
   // Only run on Monarch Money
   if (!isMonarchMoney) {
@@ -100,6 +107,16 @@ function overrideFinancialAppDisplays() {
   const style = document.createElement('style');
   style.id = 'cipher-finance-style';
   style.textContent = `
+    /* Theme-aware mask color via CSS custom properties */
+    :root {
+      --monarch-mask-dot-color: #333333;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --monarch-mask-dot-color: #cccccc;
+      }
+    }
+
     /* Hide actual text content but keep the element dimensions */
     .cipher-masked {
       color: transparent !important;
@@ -111,9 +128,10 @@ function overrideFinancialAppDisplays() {
       content: '•••' !important;
       position: absolute !important;
       left: 0 !important;
-      top: 0 !important;
-      color: white !important;
-      background: inherit !important;
+      top: 50% !important;
+      transform: translateY(-50%) !important;
+      color: var(--monarch-mask-dot-color, #888) !important;
+      background: transparent !important;
       z-index: 10000 !important;
     }
     
@@ -125,28 +143,37 @@ function overrideFinancialAppDisplays() {
       opacity: 0 !important;
     }
     
-    /* Target number-flow elements directly */
+    /* Target number-flow elements directly (both legacy and current element names) */
     number-flow-react,
+    number-flow,
     .fs-mask,
     [data-testid="budget-amount"] {
       color: transparent !important;
     }
     
+    /* Overlay dots for number-flow and special mask elements */
+    .monarch-special-mask,
+    .monarch-digit-mask,
+    .monarch-mask-overlay,
+    .monarch-cover-mask {
+      color: var(--monarch-mask-dot-color, #888) !important;
+    }
+
     /* Strong masking for Monarch Money budget page */
-    td[data-testid] span:not(.monarch-mask-overlay) {
+    td[data-testid] span:not(.monarch-mask-overlay):not(.monarch-cover-mask) {
       color: transparent !important;
     }
     
     /* Hide balance numbers completely */
-    [class*="balance"] span:not(.monarch-mask-overlay),
-    [class*="spending"] span:not(.monarch-mask-overlay),
-    [class*="value"] span:not(.monarch-mask-overlay),
-    [class*="amount"] span:not(.monarch-mask-overlay) {
+    [class*="balance"] span:not(.monarch-mask-overlay):not(.monarch-cover-mask),
+    [class*="spending"] span:not(.monarch-mask-overlay):not(.monarch-cover-mask),
+    [class*="value"] span:not(.monarch-mask-overlay):not(.monarch-cover-mask),
+    [class*="amount"] span:not(.monarch-mask-overlay):not(.monarch-cover-mask) {
       color: transparent !important;
     }
     
     /* Blanket approach for all table cells */
-    td > div > span:not(.monarch-mask-overlay) {
+    td > div > span:not(.monarch-mask-overlay):not(.monarch-cover-mask) {
       color: transparent !important;
     }
   `;
@@ -365,39 +392,21 @@ function maskTableData() {
 function processTextInElement(element) {
   if (!element || !shouldProcessNode(element)) return;
   
-  // Only mask numbers with currency symbols ($, €, £, ¥) or percentage signs (%)
-  // This targets specifically sensitive financial data
-  const sensitiveNumberRegex = /(\$|€|£|¥)\s*\d+(?:[.,]\d+)*(?:\.\d+)?|\b\d+(?:[.,]\d+)*(?:\.\d+)?\s*%/g;
-  
   // Handle immediate text in this element (not in children)
   for (const node of element.childNodes) {
     if (node.nodeType === Node.TEXT_NODE) {
-      let text = node.textContent;
-      let hasNumbers = false;
-      
-      if (sensitiveNumberRegex.test(text)) {
-        text = text.replace(sensitiveNumberRegex, '•••');
-        hasNumbers = true;
-      }
-      
-      if (hasNumbers) {
-        node.textContent = text;
+      const replaced = node.textContent.replace(new RegExp(SENSITIVE_NUMBER_REGEX.source, 'g'), '•••');
+      if (replaced !== node.textContent) {
+        node.textContent = replaced;
       }
     }
   }
   
   // In case the element has no child text nodes but has direct textContent
   if (element.childNodes.length === 0 && element.textContent.trim() !== '') {
-    let text = element.textContent;
-    let hasNumbers = false;
-    
-    if (sensitiveNumberRegex.test(text)) {
-      text = text.replace(sensitiveNumberRegex, '•••');
-      hasNumbers = true;
-    }
-    
-    if (hasNumbers) {
-      element.textContent = text;
+    const replaced = element.textContent.replace(new RegExp(SENSITIVE_NUMBER_REGEX.source, 'g'), '•••');
+    if (replaced !== element.textContent) {
+      element.textContent = replaced;
     }
   }
 }
@@ -420,6 +429,13 @@ function setupObserver() {
   // Disconnect existing observer if any
   if (observer) {
     observer.disconnect();
+  }
+  
+  // Debounced version of maskAllNumbers to avoid excessive full-page scans
+  let debounceTimer = null;
+  function debouncedMaskAll() {
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => maskAllNumbers(), 300);
   }
   
   // Create new observer
@@ -447,9 +463,8 @@ function setupObserver() {
       }
     }
     
-    // Periodically scan the whole document again for numbers
-    // This ensures we catch elements that might have been missed
-    setTimeout(() => maskAllNumbers(), 500);
+    // Debounced full-page scan to catch elements missed by targeted processing
+    debouncedMaskAll();
   });
   
   // Start observing the document with the configured parameters
@@ -458,7 +473,7 @@ function setupObserver() {
     subtree: true, 
     characterData: true,
     attributes: true,
-    attributeFilter: ['textContent', 'innerText', 'innerHTML', 'value']
+    attributeFilter: ['textContent', 'innerText', 'innerHTML', 'value', 'aria-label']
   });
   
   // Additional recurring scan to ensure we catch all numbers
@@ -466,40 +481,109 @@ function setupObserver() {
   setInterval(maskAllNumbers, 2000);
 }
 
+// Get a visible text color from an element (used before making it transparent)
+function getVisibleColor(element) {
+  const color = window.getComputedStyle(element).color;
+  if (color && color !== 'transparent' && color !== 'rgba(0, 0, 0, 0)') {
+    return color;
+  }
+  // Walk up the tree to find a parent with a real color
+  let parent = element.parentElement;
+  while (parent && parent !== document.body) {
+    const parentColor = window.getComputedStyle(parent).color;
+    if (parentColor && parentColor !== 'transparent' && parentColor !== 'rgba(0, 0, 0, 0)') {
+      return parentColor;
+    }
+    parent = parent.parentElement;
+  }
+  // Fall back to a mid-gray that's readable in both light and dark themes
+  return 'var(--monarch-mask-dot-color, #888888)';
+}
+
+// Apply a cover mask overlay to an element
+function applyCoverMask(element) {
+  if (element.dataset.monarchMasked) return;
+  
+  // Capture original color BEFORE making element transparent
+  const originalColor = getVisibleColor(element);
+  
+  element.style.color = 'transparent';
+  element.dataset.monarchMasked = '1';
+  
+  const parent = element.parentElement;
+  if (!parent) return;
+  
+  if (!parent.querySelector('.monarch-cover-mask')) {
+    if (window.getComputedStyle(parent).position === 'static') {
+      parent.style.position = 'relative';
+    }
+    
+    const mask = document.createElement('div');
+    mask.className = 'monarch-cover-mask';
+    mask.textContent = '•••';
+    mask.style.cssText = `
+      position: absolute;
+      top: 0; left: 0; right: 0; bottom: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: ${originalColor};
+      background: transparent;
+      pointer-events: none;
+      z-index: 10000;
+    `;
+    parent.appendChild(mask);
+  }
+}
+
+// Pattern that matches an aria-label whose *entire value* is a currency or percentage amount.
+// This is anchored (^ and $) so it only matches elements whose aria-label exclusively describes
+// a financial value, unlike SENSITIVE_NUMBER_REGEX which finds values embedded in longer text.
+const ariaLabelCurrencyPattern = /^\s*[-+]?\s*[\$€£¥]\s*[\d,.']+[kKmMbB]?\s*$|^\s*[\d,.']+\s*%\s*$/;
+
 // Process all existing numbers on the page
 function maskAllNumbers() {
-  // Special handling for the budget summary box in the top right - specifically target number-flow-react
-  const numberFlowElements = document.querySelectorAll('number-flow-react, .fs-mask');
+  // Strategy 1: number-flow custom elements (both legacy and current element names)
+  const numberFlowElements = document.querySelectorAll('number-flow-react, number-flow, .fs-mask');
   numberFlowElements.forEach(element => {
-    // Make the element and all its children transparent
+    if (element.dataset.monarchMasked) return;
+    
+    // Capture original color BEFORE making element transparent
+    const originalColor = getVisibleColor(element);
     element.style.color = 'transparent';
+    element.dataset.monarchMasked = '1';
     
     // Create an overlay with dots if not already present
     const parent = element.parentElement;
     if (parent && !parent.querySelector('.monarch-special-mask')) {
-      // Position the parent for absolute positioning
       if (window.getComputedStyle(parent).position === 'static') {
         parent.style.position = 'relative';
       }
       
-      // Create the mask overlay
       const mask = document.createElement('div');
       mask.className = 'monarch-special-mask';
       mask.textContent = '•••';
-      mask.style.position = 'absolute';
-      mask.style.top = '0';
-      mask.style.left = '0';
-      mask.style.width = '100%';
-      mask.style.height = '100%';
-      mask.style.backgroundColor = 'transparent';
-      mask.style.display = 'flex';
-      mask.style.alignItems = 'center';
-      mask.style.justifyContent = 'center';
-      mask.style.zIndex = '10000';
-      mask.style.color = 'white';
-      mask.style.pointerEvents = 'none';
-      
+      mask.style.cssText = `
+        position: absolute;
+        top: 0; left: 0; width: 100%; height: 100%;
+        background: transparent;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 10000;
+        color: ${originalColor};
+        pointer-events: none;
+      `;
       parent.appendChild(mask);
+    }
+  });
+
+  // Strategy 2: elements whose aria-label describes a currency or percentage value
+  document.querySelectorAll('[aria-label]').forEach(element => {
+    if (element.dataset.monarchMasked) return;
+    const label = element.getAttribute('aria-label');
+    if (label && ariaLabelCurrencyPattern.test(label)) {
+      applyCoverMask(element);
     }
   });
 
@@ -632,21 +716,10 @@ function processTextNode(node) {
     return;
   }
   
-  // Only mask numbers with currency symbols ($, €, £, ¥) or percentage signs (%)
-  // This targets specifically sensitive financial data
-  const sensitiveNumberRegex = /(\$|€|£|¥)\s*\d+(?:[.,]\d+)*(?:\.\d+)?|\b\d+(?:[.,]\d+)*(?:\.\d+)?\s*%/g;
-  
   // Replace only sensitive numbers with the mask
-  let text = node.textContent;
-  let hasNumbers = false;
-  
-  if (sensitiveNumberRegex.test(text)) {
-    text = text.replace(sensitiveNumberRegex, '•••');
-    hasNumbers = true;
-  }
-  
-  if (hasNumbers) {
-    node.textContent = text;
+  const replaced = node.textContent.replace(new RegExp(SENSITIVE_NUMBER_REGEX.source, 'g'), '•••');
+  if (replaced !== node.textContent) {
+    node.textContent = replaced;
   }
 }
 
